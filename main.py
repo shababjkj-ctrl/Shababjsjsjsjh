@@ -3,6 +3,7 @@
 #  TEAM RBC — Squad Bot (Create → Invite → Accept → PK → In-Game)
 # ═══════════════════════════════════════════════════════════════════
 import sys, asyncio, httpx, random, json, socket, struct, time, os, uuid
+import contextvars
 import itertools, secrets, traceback, base64, math
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
