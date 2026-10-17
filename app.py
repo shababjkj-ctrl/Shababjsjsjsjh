@@ -3,7 +3,7 @@
 #  TEAM RBC — Squad Bot (Group Auto-Join & Permanent Reconnect Fix)
 # ═══════════════════════════════════════════════════════════════════
 import sys, asyncio, httpx, random, json, socket, struct, time, os, uuid
-import itertools, secrets, traceback, base64, math
+import itertools, secrets, traceback, base64, math, math
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -1162,37 +1162,69 @@ async def build_match_startup_packets(token, udp_key, match_code, account_id, bl
     loading = await sv_frame(0x5A, match_code, 2, 448, 1, 1, tg, udp_key)
     return process.hex(), loading.hex()
 
-# ═══════════════════════════ MOVEMENT 2001 (FIXED FOR FULL BR MAP MOVEMENT) ═══════════════════════════
+# ═══════════════════════════ MOVEMENT 2001 (real client format, from packet capture) ═══════════════════════════
+MOVE_INTERVAL = 0.10                  # real client sends cmd 2001 at ~10Hz
+ANTI_AFK_FIRE_ENABLED = False         # cmd 104/105 are not in the capture -> off
+MOVE_MAX_DRIFT = 30000
+_MOVE_POS = {}                        # uid -> (x, y, z) own spawn position learned from server
+_MOVE_MSG_KEYS = [0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D]
+_MOVE_HEAD = bytes.fromhex("81808008")
+_MOVE_TAIL = bytes.fromhex(
+    "a70100" "69" "00000000000000"
+    "e9d5f0fb0b" "c8eabaf103" "80c9a7e603" "0000" "e606000000"
+)
+_MOVE_FALLBACK_POS = (1490388, 38184, 935724)
+_MOVE_STEP = {"idle": 0, "walk": 250, "run": 400, "sprint": 600, "jump": 300, "crouch": 0, "prone": 0}
+
+
+def _mv_varint(n):
+    n = int(n) & 0xFFFFFFFFFFFFFFFF
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _mv_read_varint(buf, off):
+    val = 0; shift = 0
+    while off < len(buf):
+        x = buf[off]; off += 1
+        val |= (x & 0x7F) << shift; shift += 7
+        if not x & 0x80:
+            return val, off
+    return None, off
+
+
+def movement_learn_position(account_id, content):
+    """First server cmd 2001 packet (x,y,z varints at offset 3) = own spawn position."""
+    uid = str(account_id)
+    if uid in _MOVE_POS or not content or len(content) < 12:
+        return
+    try:
+        x, o = _mv_read_varint(content, 3)
+        y, o = _mv_read_varint(content, o)
+        z, o = _mv_read_varint(content, o)
+        if None in (x, y, z) or x == 0 or z == 0:
+            return
+        _MOVE_POS[uid] = (x, y, z)
+        print_info(f"[MOVE] spawn position learned {uid}: {x},{y},{z}")
+    except Exception:
+        pass
+
+
 async def build_movement_packet_2001(key_bytes, msg_key, player_state, x, y, z,
                                      tick, counter, move_state, account_uid,
                                      room_code, phase="game"):
-    if phase == "game":
-        TAIL = (b"\x00"*7 + b"\x93\xca\xd5\xf9\x0b" + b"\x8e\xfe\xfc\xf7\x0b"
-                + b"\xf4\xe0\xfe\xf7\x03" + b"\x00\x00")
-    else:
-        TAIL = (b"\x00"*7 + b"\xbd\xb6\xe1\xf3\x03" + b"\x00"
-                + b"\xc4\xb6\xe1\xfb\x0b" + b"\x00\x00")
-    body = bytearray()
-    body += await uleb_encode(int(account_uid))
-    body += await uleb_encode(int(player_state))
-    body += await zigzag_encode_signed(int(x))
-    body += await zigzag_encode_signed(int(y))
-    body += await zigzag_encode_signed(int(z))
-    body += b"\x00"
-    body += await uleb_encode(int(move_state))
-    body += TAIL
-    body += await uleb_encode(int(tick))
-    body += b"\x00\x00\x00"
-    body += await uleb_encode(int(counter))
-    body = bytes(body)
-    k = key_bytes[0]; v80 = ((k << 8) | k) & 0xFFFF
-    h = bytearray()
-    h.append(msg_key & 0xFF); h.append(0x00); h.append(0x00 ^ k)
-    h += ((2001 ^ v80) & 0xFFFF).to_bytes(2, "little")
-    h += ((len(body) ^ v80) & 0xFFFF).to_bytes(2, "little")
-    h.append(0x00 ^ k)
-    h[1] = (await crc7_buff(0, bytes(h[2:]) + body)) & 0x7F
-    return bytes(h) + body
+    """x,y,z = ABSOLUTE position; tick = elapsed ms. Header order follows the match mask."""
+    body = (_MOVE_HEAD + _mv_varint(x) + _mv_varint(y) + _mv_varint(z)
+            + _MOVE_TAIL + _mv_varint(tick))
+    _, nr = await layouts_from_mask(room_code)
+    return await build_packet(msg_key, nr, 0, 2001, None, 0, body, key_bytes, encrypted=False)
 
 class MovementTracker:
     PLAYER_STATE = {"idle": 0, "walk": 1, "run": 2, "sprint": 3, "jump": 4, "crouch": 5, "prone": 6}
@@ -1230,27 +1262,44 @@ class MovementTracker:
 async def movement_worker(sock, ip, port, udp_key_bytes, match_code, account_id, stop_event, match_index):
     loop = asyncio.get_event_loop(); addr = (ip, port)
     tracker = MovementTracker(pattern=MOVEMENT_PATTERN, radius=MOVEMENT_RADIUS)
+    uid = str(account_id)
     sent = 0
+    t0 = time.time()
     try:
-        await asyncio.sleep(bypass_jitter(3.0, 0.5))
+        for _ in range(30):   # wait up to ~3s for spawn position
+            if uid in _MOVE_POS or stop_event.is_set():
+                break
+            await asyncio.sleep(0.1)
+        bx, by, bz = _MOVE_POS.get(uid, _MOVE_FALLBACK_POS)
+        x, y, z = bx, by, bz
+        ang = random.uniform(0, 6.2832)
         while not stop_event.is_set():
             try:
-                ps, x, y, z, ms, tick, cnt, sm, st = tracker.next()
-                pkt = await build_movement_packet_2001(udp_key_bytes, 0x6B, ps, x, y, z, tick, cnt, ms,
-                                                       account_id, match_code, phase="game")
+                ps, _x, _y, _z, ms, tick, cnt, sm, st = tracker.next()
+                step = _MOVE_STEP.get(st, 0)
+                if step:
+                    ang += random.uniform(-0.15, 0.15)
+                    nx = x + int(step * math.cos(ang)); nz = z + int(step * math.sin(ang))
+                    if abs(nx - bx) > MOVE_MAX_DRIFT or abs(nz - bz) > MOVE_MAX_DRIFT:
+                        ang += 3.1416
+                    else:
+                        x, z = nx, nz
+                msg_key = _MOVE_MSG_KEYS[sent % len(_MOVE_MSG_KEYS)]
+                elapsed = int((time.time() - t0) * 1000) + 1000
+                pkt = await build_movement_packet_2001(udp_key_bytes, msg_key, ps, x, y, z, elapsed, cnt, ms,
+                                                       account_id, match_code)
                 await loop.sock_sendto(sock, pkt, addr); sent += 1
-                if sent % 30 == 0: print_info(f"[MOVE] #{match_index} sent={sent} {st}({ps}) rate={sm}x")
-                base = MOVEMENT_TICK_MS / 1000.0
-                try: smx = max(0.7, min(float(sm), 1.6))
-                except Exception: smx = 1.0
-                wait = max(0.10, min(base / smx, 0.40))
-                wait = bypass_packet_jitter(wait, 0.20)
-                try: await asyncio.wait_for(stop_event.wait(), timeout=wait); break
+                if sent % 50 == 0: print_info(f"[MOVE] #{match_index} sent={sent} {st}")
+                try: await asyncio.wait_for(stop_event.wait(), timeout=MOVE_INTERVAL); break
                 except asyncio.TimeoutError: pass
             except asyncio.CancelledError: break
-            except Exception: await asyncio.sleep(0.5)
+            except Exception as e:
+                print_warning(f"[MOVE] error: {e}")
+                await asyncio.sleep(0.5)
     except asyncio.CancelledError: pass
-    finally: print_info(f"[MOVE] #{match_index} stopped sent={sent}")
+    finally:
+        _MOVE_POS.pop(uid, None)
+        print_info(f"[MOVE] #{match_index} stopped sent={sent}")
 
 async def send_anti_afk_fire(sock, addr, udp_key_bytes, match_code, account_id):
     try:
@@ -1319,9 +1368,10 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             nonlocal anti_task, move_task, anti_started
             if anti_started: return
             anti_started = True
-            anti_task = asyncio.create_task(anti_afk_worker(sock, rip, port, udp_key_bytes, match_code,
-                                                            account_id, anti_stop, match_index))
-            print_success(f"[AFK] Worker #{match_index}")
+            if ANTI_AFK_FIRE_ENABLED:
+                anti_task = asyncio.create_task(anti_afk_worker(sock, rip, port, udp_key_bytes, match_code,
+                                                                account_id, anti_stop, match_index))
+                print_success(f"[AFK] Worker #{match_index}")
             if ENABLE_SPEED_MOVEMENT:
                 move_task = asyncio.create_task(movement_worker(sock, rip, port, udp_key_bytes, match_code,
                                                                 account_id, move_stop, match_index))
@@ -1355,6 +1405,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     frame = await decode_packet(resp, udp_key_bytes, match_code)
                     if frame:
                         pt = await classify(frame)
+                        if frame['cmd'] == 2001:
+                            movement_learn_position(account_id, frame.get('content'))
                         if frame['cmd'] in [103, 107]:
                             print_success(f"[MATCH #{match_index}] ELIMINATED/END cmd={frame['cmd']} for UID {uid_str}")
                             completed = True
